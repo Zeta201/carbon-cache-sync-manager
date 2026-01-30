@@ -17,6 +17,7 @@
  */
 package org.wso2.carbon.cache.sync.jms.manager;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import org.apache.commons.lang.StringUtils;
@@ -34,6 +35,8 @@ import java.io.InvalidClassException;
 import java.io.ObjectInputStream;
 import java.io.ObjectStreamClass;
 import java.util.Base64;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import javax.cache.Cache;
 import javax.cache.CacheEntryInfo;
@@ -63,6 +66,12 @@ public class JMSConsumer {
 
     private static final Log log = LogFactory.getLog(JMSConsumer.class);
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+    private static final Pattern LEGACY_MESSAGE_PATTERN = Pattern.compile(
+            "ClusterCacheInvalidationRequest\\{tenantId=(?<tenantId>-?\\d+), " +
+                    "tenantDomain='(?<tenantDomain>[\\w.]+)', messageId=(?<messageId>[\\w-]+), " +
+                    "cacheManager=(?<cacheManager>[\\w.]+), cache=(?<cache>.*?), cacheKey=(?<cacheKey>.*?)\\}"
+    );
+
 
     private final ConnectionFactory connectionFactory;
     private final InitialContext initialContext;
@@ -133,54 +142,99 @@ public class JMSConsumer {
         }
     }
 
+
     @SuppressFBWarnings
     public void invalidateCache(String message) {
 
+        CacheEntryInfo cacheEntryInfo;
+
         try {
-            CacheInvalidationMessageDTO dto = OBJECT_MAPPER.readValue(message, CacheInvalidationMessageDTO.class);
-            Object cacheKey = deserializeFromBase64(dto.getCacheKeyBase64());
-
-            if (log.isDebugEnabled()) {
-                log.debug("Received cache invalidation message from other cluster nodes for '" + cacheKey +
-                        "' of the cache '" + dto.getCacheName() + "' of the cache manager '" + dto.getCacheManagerName()
-                        + "'.");
-            }
-
-            try {
-                PrivilegedCarbonContext.startTenantFlow();
-                PrivilegedCarbonContext carbonContext = PrivilegedCarbonContext.getThreadLocalCarbonContext();
-                carbonContext.setTenantId(dto.getTenantId());
-                carbonContext.setTenantDomain(dto.getTenantDomain());
-                CacheManager cacheMgr = Caching.getCacheManagerFactory()
-                                    .getCacheManager(dto.getCacheManagerName());
-                Cache<Object, Object> cacheObject = cacheMgr.getCache(dto.getCacheName());
-                if (cacheObject instanceof CacheImpl) {
-                    if (JMSUtils.CLEAR_ALL_PREFIX.equals(cacheKey)) {
-                        ((CacheImpl<?, ?>) cacheObject).removeAllLocal();
-                    } else {
-                        ((CacheImpl<?, ?>) cacheObject).removeLocal(cacheKey);
-                    }
-                }
-            } finally {
-                PrivilegedCarbonContext.endTenantFlow();
-            }
-
-            // If hybrid mode is enabled pass invalidation msg to local cluster.
-            if (JMSUtils.getRunInHybridModeProperty() && cacheKey != null) {
-                CacheEntryInfo cacheEntryInfo = new CacheEntryInfo(
-                        dto.getCacheManagerName(),
-                        dto.getCacheName(),
-                        cacheKey,
-                        dto.getTenantDomain(),
-                        dto.getTenantId()
-                );
-                log.debug("Sending cache invalidation message for local clustering: " + cacheEntryInfo);
-                ClusterCacheInvalidationRequestSender cacheInvalidationRequestSender =
-                        new ClusterCacheInvalidationRequestSender();
-                cacheInvalidationRequestSender.send(cacheEntryInfo);
-            }
+            cacheEntryInfo = parseCacheInvalidationMessage(message);
         } catch (Exception e) {
             log.error("Error processing cache invalidation message", e);
+            return;
+        }
+
+        if (cacheEntryInfo == null) {
+            log.debug("Input does not match any supported cache invalidation message format.");
+            return;
+        }
+
+        if (log.isDebugEnabled()) {
+            log.debug("Received cache invalidation message for '" + cacheEntryInfo.getCacheKey()
+                    + "' of the cache '" + cacheEntryInfo.getCacheName()
+                    + "' of the cache manager '" + cacheEntryInfo.getCacheManagerName() + "'.");
+        }
+
+        invalidateLocalCache(cacheEntryInfo);
+
+        // If hybrid mode is enabled, propagate to local cluster
+        if (JMSUtils.getRunInHybridModeProperty()) {
+            log.debug("Sending cache invalidation message for local clustering: " + cacheEntryInfo);
+            new ClusterCacheInvalidationRequestSender().send(cacheEntryInfo);
+        }
+    }
+
+    private CacheEntryInfo parseCacheInvalidationMessage(String message) throws IOException {
+
+        // Try new JSON-based format first
+        try {
+            CacheInvalidationMessageDTO dto =
+                    OBJECT_MAPPER.readValue(message, CacheInvalidationMessageDTO.class);
+
+            Object cacheKey = deserializeFromBase64(dto.getCacheKeyBase64());
+
+            return new CacheEntryInfo(
+                    dto.getCacheManagerName(),
+                    dto.getCacheName(),
+                    cacheKey,
+                    dto.getTenantDomain(),
+                    dto.getTenantId()
+            );
+        } catch (JsonProcessingException e) {
+            // Not a JSON-based message; fall back to legacy format
+            if (log.isDebugEnabled()) {
+                log.debug("Message is not in JSON format. Falling back to legacy cache invalidation message parsing.");
+            }
+        }
+
+        Matcher matcher = LEGACY_MESSAGE_PATTERN.matcher(message);
+        if (!matcher.find()) {
+            return null;
+        }
+
+        return new CacheEntryInfo(
+                matcher.group("cacheManager"),
+                matcher.group("cache"),
+                matcher.group("cacheKey"),
+                matcher.group("tenantDomain"),
+                Integer.parseInt(matcher.group("tenantId"))
+        );
+    }
+
+    private void invalidateLocalCache(CacheEntryInfo cacheEntryInfo) {
+
+        PrivilegedCarbonContext.startTenantFlow();
+        try {
+            PrivilegedCarbonContext carbonContext =
+                    PrivilegedCarbonContext.getThreadLocalCarbonContext();
+            carbonContext.setTenantId(cacheEntryInfo.getTenantId());
+            carbonContext.setTenantDomain(cacheEntryInfo.getTenantDomain());
+
+            CacheManager cacheManager = Caching.getCacheManagerFactory()
+                    .getCacheManager(cacheEntryInfo.getCacheManagerName());
+            Cache<Object, Object> cache = cacheManager.getCache(cacheEntryInfo.getCacheName());
+
+            if (cache instanceof CacheImpl) {
+                Object cacheKey = cacheEntryInfo.getCacheKey();
+                if (JMSUtils.CLEAR_ALL_PREFIX.equals(cacheKey)) {
+                    ((CacheImpl<?, ?>) cache).removeAllLocal();
+                } else {
+                    ((CacheImpl<?, ?>) cache).removeLocal(cacheKey);
+                }
+            }
+        } finally {
+            PrivilegedCarbonContext.endTenantFlow();
         }
     }
 
